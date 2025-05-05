@@ -1,5 +1,16 @@
 import base64
 
+import logging
+import colorlog
+import os
+import sys
+import gradio as gr
+
+from pathlib import Path
+from PIL import Image
+from llama_index.core import SimpleDirectoryReader
+
+from huggingface_hub import whoami
 from typing import List, TypedDict, Annotated, Optional
 from langchain.schema import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -8,14 +19,81 @@ from langgraph.graph.message import add_messages
 from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import tools_condition
 from langgraph.prebuilt import ToolNode
-from IPython.display import Image, display
+from langchain_community.retrievers import BM25Retriever
+from langchain.tools import Tool
+from langchain.docstore.document import Document
+
 from dotenv import load_dotenv
 
 
 load_dotenv()
 vision_llm = ChatOpenAI(model="gpt-4o")
 
+log_colors = {
+    "DEBUG": "cyan",
+    "INFO": "green",
+    "WARNING": "yellow",
+    "ERROR": "red",
+    "CRITICAL": "bold_red",
+}
 
+formatter = colorlog.ColoredFormatter(
+    "%(log_color)s%(levelname)s:%(reset)s %(message)s",
+    log_colors=log_colors,
+)
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+logger.addHandler(handler)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+logger.debug(f"running on {sys.platform}")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# load data from directory
+input_dir = Path("C:/Users/lavml/Documents/Datasets/cooking_fast/")
+logger.info(f"huggingface user fullname: {whoami()['fullname']}")
+logger.info(f"\n[loading data from {input_dir}]")
+
+documents_dataset = SimpleDirectoryReader(input_dir=input_dir).load_data(show_progress=True)  # encoding="latin-1
+
+docs = [
+    Document(
+        page_content="\n".join([
+            f"text: {doc.text_resource.text}",
+        ]),
+        metadata={"id": doc.id_, "file_name": doc.metadata["file_name"]}
+    )
+    for doc in documents_dataset
+]
+
+bm25_retriever = BM25Retriever.from_documents(docs)
+
+
+def retrieve_text_from_cookbook(query: str) -> str:
+    """
+    Retrieves information from a knowledge cookbook using a bm25_retriever.
+    """
+    results = bm25_retriever.invoke(query)
+    if results:
+        return "\n\n".join([doc.page_content for doc in results[:3]])
+    else:
+        return "No matching guest information found."
+
+
+cookbook_search_retriever_tool = Tool(
+    name="guest_info_retriever",
+    func=retrieve_text_from_cookbook,
+    description="Retrieves detailed information about gala guests based on their name or relation."
+)
+
+#---------------------------------------------------------------------------
 # AnyMessage: class for messages
 # add_messages: operator that add the latest message rather than overwriting it with the latest state.
 # This is a new concept in LangGraph, where you can add operators in your state to define the way they should interact together.
@@ -26,11 +104,12 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
+# tool
 def extract_text(img_path: str) -> str:
     """
     Extract text from an image file using a multimodal model.
 
-    Master Wayne often leaves notes with his training regimen or meal plans.
+    The files often contain meal plans.
     This allows me to properly analyze the contents.
     """
     all_text = ""
@@ -75,16 +154,10 @@ def extract_text(img_path: str) -> str:
         return ""
 
 
-# dummy
-def divide(a: int, b: int) -> float:
-    """Divide a and b - for Master Wayne's occasional calculations."""
-    return a / b
-
-
-# Equip the butler with tools
+# Equip the Chef with tools
 tools = [
-    divide,
-    extract_text
+    extract_text,
+    retrieve_text_from_cookbook
 ]
 
 llm = ChatOpenAI(model="gpt-4o")
@@ -102,9 +175,15 @@ def assistant(state: AgentState):
     
         Returns:
             A single string containing the concatenated text extracted from each image.
+        
+    retrieve_text_from_cookbook(query: str) -> str:
+        Retrieves information from a knowledge cookbook using a bm25_retriever.
+        
+        Args:
+            query: The key query to search in the cookbook to retrieve information from.
             
-    divide(a: int, b: int) -> float:
-        Divide a and b
+        Returns:
+            A string with the page_content which is the matching content to the reference query.
     """
     image=state["input_file"]
     sys_msg = SystemMessage(content=f"You are an helpful cooking assistant called ChefNet. You can analyse documents and run computations with provided tools:\n{textual_description_of_tool} \n You have access to some optional images. Currently the loaded image is: {image}")
@@ -131,27 +210,95 @@ builder.add_conditional_edges(
     tools_condition,
 )
 builder.add_edge("tools", "assistant")
-react_graph = builder.compile()
+chefnet = builder.compile()  # react_graph
 
-# Show the butler's thought process
-image_data = react_graph.get_graph(xray=True).draw_mermaid_png()
+# Show the Chef's thought process
+image_data = chefnet.get_graph(xray=True).draw_mermaid_png()
 
 with open("chefnet_thought_process.png", "wb") as f:
     f.write(image_data)
 
 
+def respond(user_message, image_path, history):
+    """
+    Process the input text and optional image.
+
+    Args:
+        user_message (str): The text message from the user.
+        image_path (str or None): File path to the uploaded image.
+        history (list): List of tuples holding conversation history.
+
+    Returns:
+        tuple: (new_history, cleared_text, cleared_image)
+    """
+    # Start building the bot's response based on text input.
+    metadata = f"Got your message: '{user_message}'"
+
+    # If an image file path was provided, process it.
+    if image_path:
+        if os.path.exists(image_path):
+            try:
+                # Open the image and extract its size and format info.
+                img = Image.open(image_path)
+                metadata += f" and the image has size {img.size} (format: {img.format})."
+            except Exception as e:
+                metadata += f" but there was an error opening the image: {e}"
+        else:
+            metadata += " but the provided image path is invalid."
+
+    messages = [HumanMessage(content=user_message)]
+    response = chefnet.invoke({"messages": messages, "input_file": image_path})
+
+    # Show the messages
+    for m in response['messages']:
+        m.pretty_print()
+
+    final_answer = response['messages'][-1].content
+    history = history + [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": f"metadata: {metadata}"},
+        {"role": "assistant", "content": final_answer}
+    ]
+    return history, "", None
+
+
 if __name__ == "__main__":
-    messages = [HumanMessage(content="Divide 6790 by 5")]
-    messages = react_graph.invoke({"messages": messages, "input_file": None})
+    # Build the Gradio Blocks layout.
+    with gr.Blocks() as demo:
+        # Chatbot component to display conversation history.
+        chatbot_history = gr.Chatbot(label="Chat History", type="messages")
 
-    # Show the messages
-    for m in messages['messages']:
-        m.pretty_print()
+        # Create a row for user inputs.
+        with gr.Row():
+            txt_input = gr.Textbox(
+                placeholder="Type your message here...",
+                label="Your Message"
+            )
+            image_input = gr.Image(
+                type="filepath",  # image is received as a file path (a str)
+                label="Upload an Image (optional)"
+            )
 
-    messages = [HumanMessage(
-        content="According to the information found in the provided image. What's the list of ingredients I should buy to prepare the dish?")]
-    messages = react_graph.invoke({"messages": messages, "input_file": "data/image_1.jpg"})
+        # A button to submit the message.
+        submit = gr.Button("Send")
 
-    # Show the messages
-    for m in messages['messages']:
-        m.pretty_print()
+        # State is used to hold the conversation history.
+        state = gr.State([])
+
+        # Wire up the event: when the button is clicked, process the inputs.
+        submit.click(
+            fn=respond,
+            inputs=[txt_input, image_input, state],
+            outputs=[chatbot_history, txt_input, image_input],
+            queue=True
+        )
+
+    # Launch the app.
+    demo.launch()
+
+
+# todo: separate tools and retriever (add SentenceTransformers, or vectorDB as Itty)
+# https://huggingface.co/spaces/agents-course/Unit_3_Agentic_RAG/tree/main
+# todo: [opc] ideally have the 3 rag options, to compare them, and add traceability/observability
+
+# build on top of that if you need to, kick off LangGraph course
