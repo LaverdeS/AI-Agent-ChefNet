@@ -295,10 +295,3 @@ if __name__ == "__main__":
 
     # Launch the app.
     demo.launch()
-
-
-# todo: separate tools and retriever (add SentenceTransformers, or vectorDB as Itty)
-# https://huggingface.co/spaces/agents-course/Unit_3_Agentic_RAG/tree/main
-# todo: [opc] ideally have the 3 rag options, to compare them, and add traceability/observability
-
-# build on top of that if you need to, kick off LangGraph course
